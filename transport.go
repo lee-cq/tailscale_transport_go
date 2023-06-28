@@ -12,9 +12,9 @@ import (
 )
 
 var (
-	remote_port = flag.String("remote_port", "nil", "tailscale中的远程端口, 格式: <ip|Hostname>:port")
-	local_port  = flag.String("local_port", "nil", "本地需要被监听的端口，格式 [ip|hostname]:port")
-	hostname    = flag.String("hostname", "tsnet-translate", "hostname to use on the tailnet")
+	remotePort = flag.String("remotePort", "nil", "tailscale中的远程端口, 格式: <ip|Hostname>:port")
+	localPort  = flag.String("localPort", "nil", "本地需要被监听的端口，格式 [ip|hostname]:port")
+	hostname   = flag.String("hostname", "tsnet-translate", "hostname to use on the tsnet")
 )
 
 func main() {
@@ -22,18 +22,23 @@ func main() {
 	flag.Parse()
 
 	fmt.Println("初始化 tsnet.Server")
-	ts_server := new(tsnet.Server)
-	ts_server.Hostname = *hostname
+	tsServer := new(tsnet.Server)
+	tsServer.Hostname = *hostname
 
-	defer fmt.Println("tsnet Server stoped ...")
-	defer ts_server.Close()
+	defer fmt.Println("tsnet Server a has topped .")
+	defer func(tsServer *tsnet.Server) {
+		err := tsServer.Close()
+		if err != nil {
+			return
+		}
+	}(tsServer)
 
 	fmt.Println("开始链接至tsnet")
-	if err := ts_server.Start(); err != nil {
+	if err := tsServer.Start(); err != nil {
 		return
 	}
 	fmt.Println("监听端口 8888")
-	listener, err := net.Listen("tcp", *local_port)
+	listener, err := net.Listen("tcp", *localPort)
 	if err != nil {
 		fmt.Println("Error: ", err)
 		return
@@ -42,70 +47,75 @@ func main() {
 	for {
 		// 收到信号退出
 
-		conn_local, err := listener.Accept()
-		fmt.Printf("收到连接: %-v", conn_local)
+		connLocal, err := listener.Accept()
+		fmt.Printf("收到连接: %-v", connLocal)
 		if err != nil {
 			fmt.Println("Error: ", err)
 			continue
 		}
-		defer conn_local.Close()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
 
-		ts_conn, err := ts_server.Dial(ctx, "tcp", *remote_port)
+		tsConn, err := tsServer.Dial(ctx, "tcp", *remotePort)
 		if err != nil {
+			cancel()
 			fmt.Println("Error: ", err)
 			continue
 		}
-		defer ts_conn.Close()
 
-		go handleConnection(conn_local, ts_conn)
+		go handleConnection(connLocal, tsConn)
 	}
 }
 
-func handleConnection(conn_local net.Conn, conn_remote net.Conn) {
-	var rx_byte int64 = 0
-	var tx_byte int64 = 0
-	var has_error bool = true
+func handleConnection(connLocal net.Conn, connRemote net.Conn) {
+	var rxByte int64 = 0
+	var txByte int64 = 0
+	var hasError = true
 
-	// remote, err := net.Dial("tcp", "localhost:9999")
-	// if err != nil {
-	// 	fmt.Println("Error: ", err)
-	// 	return
-	// }
+	// 结束时关闭连接
+	defer func(tsConn net.Conn) {
+		_ = tsConn.Close()
+	}(connLocal)
 
+	defer func(tsConn net.Conn) {
+		_ = tsConn.Close()
+	}(connRemote)
+
+	// 开启 Local -> Remote 数据拷贝 goroutine
 	go func() {
-		_, err := copyData(conn_local, conn_remote, &rx_byte)
+		_, err := copyData(connLocal, connRemote, &rxByte)
 		if err != nil {
 			fmt.Printf("conn Error: %v\n", err)
-			has_error = true
+			hasError = true
 			return
 		}
 	}()
 
+	// 开启 Remote -> Local 数据拷贝 goroutine
 	go func() {
-		_, err := copyData(conn_remote, conn_local, &tx_byte)
+		_, err := copyData(connRemote, connLocal, &txByte)
 		if err != nil {
 			fmt.Printf("remote Error: %v\n", err)
+			hasError = true
 			return
 		}
 	}()
 
+	// 更新进度到控制台
 	for {
 		time.Sleep(time.Second)
-		fmt.Printf("\rrx: %d, tx: %d", rx_byte, tx_byte)
-		if has_error {
+		fmt.Printf("\rrx: %d, tx: %d", rxByte, txByte)
+		if hasError {
 			fmt.Println("")
 			return
 		}
 	}
 }
 
-/** 数据拷贝goroute
+/** 数据拷贝goroutine
  * 在一个循环中监听并
  */
-func copyData(src net.Conn, dst net.Conn, p_len *int64) (int, error) {
+func copyData(src net.Conn, dst net.Conn, pLen *int64) (int, error) {
 	for {
 
 		buf := make([]byte, 256)
@@ -119,7 +129,7 @@ func copyData(src net.Conn, dst net.Conn, p_len *int64) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		*p_len += int64(n)
+		*pLen += int64(n)
 	}
 	// return *p_len, _
 }
