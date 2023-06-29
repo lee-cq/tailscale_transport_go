@@ -1,4 +1,3 @@
-// 端口转发
 package main
 
 import (
@@ -6,10 +5,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"time"
 
+	"github.com/lee-cq/tailscale-transport/logger"
 	"tailscale.com/tsnet"
 )
 
@@ -40,20 +41,27 @@ func createConfig() {
 		Authkey:   "认证密钥",
 		Ephemeral: false,
 		Dir:       "文件存储位置",
+
+		Transports: []Transport{
+			{
+				RemotePort: "Remote:Port",
+				LocalPort:  "Local:port",
+			},
+			{
+				RemotePort: "New",
+				LocalPort:  "New",
+			},
+		},
 	}
-	t := Transport{
-		RemotePort: "RemoteIP:port",
-		LocalPort:  "LocalIP:port",
-	}
-	config.Transports = append(config.Transports, t)
 
 	jsonBytes, _ := json.Marshal(config)
 
-	println("在 %s 目录下", dir)
-	err := os.WriteFile("config.json", jsonBytes, 'w')
+	fmt.Printf("在 %s 目录下创建 config.json .... \n", dir)
+	err := os.WriteFile("config.json", jsonBytes, 0o0664)
 	if err != nil {
 		fmt.Println("Write Error")
 	}
+	fmt.Println(" Done.")
 }
 
 func GetConfig() {
@@ -75,16 +83,14 @@ func GetConfig() {
 		fmt.Printf("Json 解析失败 %v \n", err)
 		os.Exit(1)
 	}
+	logger.Info("配置解析完成, hostname: %s", config.Hostname)
 }
 
 func main() {
-	// 初始化配置
-
 	defer fmt.Println("All End ...")
-
 	GetConfig()
 
-	fmt.Println("初始化 tsnet.Server, 配置相关服务")
+	logger.Info("初始化 tsnet.Server, 配置相关服务")
 	tsServer := new(tsnet.Server)
 	tsServer.Hostname = config.Hostname
 	tsServer.Ephemeral = config.Ephemeral
@@ -102,117 +108,143 @@ func main() {
 			return
 		}
 	}(tsServer)
-	// 配置tsServer完成 ...
 
 	fmt.Println("开始链接至tsnet")
 	if err := tsServer.Start(); err != nil {
 		return
 	}
-	// tsServer完成
-	for _, transport := range config.Transports {
-		go Transporter(tsServer, transport.RemotePort, transport.LocalPort)
-	}
-	defer fmt.Println("Ok, Will be Done ... ")
+	ip4, _ := tsServer.TailscaleIPs()
+	logger.Info("tsnet Start Success, IP: %s", ip4)
+	// 配置tsServer完成 ...
 
+	mainSignal := make(chan int)
+	for _, transport := range config.Transports {
+		fmt.Printf("创建Goroutine %s -> %s\n", transport.RemotePort, transport.LocalPort)
+		go func(transport Transport) {
+			local2RemoteTCP(tsServer, transport.RemotePort, transport.LocalPort)
+			mainSignal <- 1
+		}(transport)
+	}
+
+	defer fmt.Println("Ok, Will be Done ... ")
+	var allDone int
+	allT := len(config.Transports)
 	for {
-		time.Sleep(time.Minute)
+		allDone += <-mainSignal
+		if allDone >= allT {
+			break
+		}
 	}
 }
 
-func Transporter(tsServer *tsnet.Server, remotePort string, localPort string) {
-	fmt.Println("监听端口", localPort)
-	listener, err := net.Listen("tcp", localPort)
+func local2RemoteTCP(tsServer *tsnet.Server, remote string, local string) {
+
+	defer logger.Info("已经关闭  %s <--> %s", local, remote)
+	listener, err := net.Listen("tcp", local)
 	if err != nil {
-		fmt.Println("Error: ", err)
+		logger.Warn("Listen on %s error: %s", local, err.Error())
 		return
 	}
+	defer listener.Close()
 
 	for {
-		// 收到信号退出
+		logger.Info("Wait for connection on %s", local)
 
-		connLocal, err := listener.Accept()
-		fmt.Printf("收到连接: %-v", connLocal)
+		localConn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Error: ", err)
+			logger.Warn("Handle local connect error: %s", err.Error())
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		go func() { // 在gorouine中开启线程
+			defer localConn.Close()
 
-		tsConn, err := tsServer.Dial(ctx, "tcp", remotePort)
-		if err != nil {
-			cancel()
-			fmt.Println("Error: ", err)
-			continue
-		}
+			logger.Info("Connection from %s", localConn.RemoteAddr().String())
+			logger.Info("Connecting " + remote)
 
-		go handleConnection(connLocal, tsConn)
+			// ctx := context.W
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer func() {
+				cancel()
+			}()
+
+			remoteConn, err := tsServer.Dial(ctx, "tcp", remote)
+			if err != nil {
+				logger.Warn("Connect remote %s error: %s", remote, err.Error())
+				return
+			}
+			defer func() {
+				err := remoteConn.Close()
+				if err != nil {
+					logger.Warn("remoteConn Close Error...")
+				}
+			}()
+
+			logger.Info("Open pipe: %s <== FWD ==> %s",
+				localConn.RemoteAddr().String(), remoteConn.RemoteAddr().String())
+
+			PipeForward(localConn, remoteConn)
+
+			logger.Info("Close pipe: %s <== FWD ==> %s",
+				localConn.RemoteAddr().String(), remoteConn.RemoteAddr().String())
+
+		}()
+
 	}
 }
 
-func handleConnection(connLocal net.Conn, connRemote net.Conn) {
-	var rxByte int64 = 0
-	var txByte int64 = 0
-	var hasError = true
+func PipeForward(connA net.Conn, connB net.Conn) {
+	// 创建管道
+	pipeSignal := make(chan struct{}, 1)
 
-	// 结束时关闭连接
-	defer func(tsConn net.Conn) {
-		_ = tsConn.Close()
-	}(connLocal)
-
-	defer func(tsConn net.Conn) {
-		_ = tsConn.Close()
-	}(connRemote)
-
-	// 开启 Local -> Remote 数据拷贝 goroutine
 	go func() {
-		_, err := copyData(connLocal, connRemote, &rxByte)
-		if err != nil {
-			fmt.Printf("conn Error: %v\n", err)
-			hasError = true
-			return
-		}
+		Copy(connA, connB)
+		pipeSignal <- struct{}{}
 	}()
 
-	// 开启 Remote -> Local 数据拷贝 goroutine
 	go func() {
-		_, err := copyData(connRemote, connLocal, &txByte)
-		if err != nil {
-			fmt.Printf("remote Error: %v\n", err)
-			hasError = true
-			return
-		}
+		Copy(connB, connA)
+		pipeSignal <- struct{}{}
 	}()
 
-	// 更新进度到控制台
-	for {
-		time.Sleep(time.Second)
-		fmt.Printf("\rrx: %d, tx: %d", rxByte, txByte)
-		if hasError {
-			fmt.Println("")
-			return
-		}
-	}
+	<-pipeSignal
 }
 
-/** 数据拷贝goroutine
- * 在一个循环中监听并
- */
-func copyData(src net.Conn, dst net.Conn, pLen *int64) (int, error) {
+func Copy(dst net.Conn, src net.Conn) (int, error) {
+	buffer := make([]byte, 0x8000)
+	var written int
+	var err error
+
 	for {
+		var nr int
+		var er error
 
-		buf := make([]byte, 256)
+		nr, er = src.Read(buffer)
+		if nr > 0 {
+			var nw int
+			var ew error
 
-		n, err := src.Read(buf)
-		if err != nil {
-			return 0, err
+			nw, ew = dst.Write(buffer[:nr])
+
+			if nw > 0 {
+				logger.Info("%s == [%d bytes] ==> %s", src.RemoteAddr().String(), nw, dst.LocalAddr().String())
+				written += nw
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
 		}
-
-		n, err = dst.Write(buf[:n])
-		if err != nil {
-			return 0, err
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
 		}
-		*pLen += int64(n)
 	}
-	// return *p_len, _
+	return written, err
 }
