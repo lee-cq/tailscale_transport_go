@@ -28,14 +28,15 @@ type Config struct {
 	Transports []Transport `json:"transports"`
 }
 
+var config Config
 var (
-	config     = Config{}
 	configFile = flag.String("c", "config.json", "配置文件")
 	newFile    = flag.Bool("n", false, "在当前目录中创建模板")
 )
 
+// 创建配置文件模版
 func createConfig() {
-	dir, _ := os.Getwd()
+
 	config := Config{
 		Hostname:  "注册在TSNET中的主机名",
 		Authkey:   "认证密钥",
@@ -56,6 +57,7 @@ func createConfig() {
 
 	jsonBytes, _ := json.Marshal(config)
 
+	dir, _ := os.Getwd()
 	fmt.Printf("在 %s 目录下创建 config.json .... \n", dir)
 	err := os.WriteFile("config.json", jsonBytes, 0o0664)
 	if err != nil {
@@ -64,6 +66,7 @@ func createConfig() {
 	fmt.Println(" Done.")
 }
 
+// GetConfig 命令行参数解析
 func GetConfig() {
 	flag.Parse()
 
@@ -118,12 +121,12 @@ func main() {
 	// 配置tsServer完成 ...
 
 	mainSignal := make(chan int)
-	for _, transport := range config.Transports {
-		fmt.Printf("创建Goroutine %s -> %s\n", transport.RemotePort, transport.LocalPort)
+	for i := 0; i < len(config.Transports); i++ {
+		fmt.Printf("创建Goroutine %s -> %s\n", config.Transports[i].RemotePort, config.Transports[i].LocalPort)
 		go func(transport Transport) {
 			local2RemoteTCP(tsServer, transport.RemotePort, transport.LocalPort)
 			mainSignal <- 1
-		}(transport)
+		}(config.Transports[i])
 	}
 
 	defer fmt.Println("Ok, Will be Done ... ")
@@ -140,39 +143,46 @@ func main() {
 func local2RemoteTCP(tsServer *tsnet.Server, remote string, local string) {
 
 	defer logger.Info("已经关闭  %s <--> %s", local, remote)
+	// 创建 监听端口
 	listener, err := net.Listen("tcp", local)
 	if err != nil {
 		logger.Warn("Listen on %s error: %s", local, err.Error())
 		return
 	}
-	defer listener.Close()
+	defer func(listener net.Listener) {
+		_ = listener.Close()
+	}(listener)
 
 	for {
 		logger.Info("Wait for connection on %s", local)
-
+		// 等待连接接入
 		localConn, err := listener.Accept()
 		if err != nil {
 			logger.Warn("Handle local connect error: %s", err.Error())
 			continue
 		}
 
-		go func() { // 在gorouine中开启线程
-			defer localConn.Close()
+		go func() { // 在goroutines中开启线程
+			defer func(localConn net.Conn) {
+				_ = localConn.Close()
+			}(localConn)
 
 			logger.Info("Connection from %s", localConn.RemoteAddr().String())
 			logger.Info("Connecting " + remote)
 
-			// ctx := context.W
+			// 创建上下文
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer func() {
 				cancel()
 			}()
 
+			// 创建远程连接并处理错
 			remoteConn, err := tsServer.Dial(ctx, "tcp", remote)
 			if err != nil {
 				logger.Warn("Connect remote %s error: %s", remote, err.Error())
 				return
 			}
+			// 结束时关闭远程连接，并处理错误
 			defer func() {
 				err := remoteConn.Close()
 				if err != nil {
@@ -193,21 +203,22 @@ func local2RemoteTCP(tsServer *tsnet.Server, remote string, local string) {
 	}
 }
 
-func PipeForward(connA net.Conn, connB net.Conn) {
+func PipeForward(connA net.Conn, connB net.Conn) int {
 	// 创建管道
-	pipeSignal := make(chan struct{}, 1)
+	pipeSignal := make(chan int)
 
 	go func() {
-		Copy(connA, connB)
-		pipeSignal <- struct{}{}
+		sizeA, _ := Copy(connA, connB)
+		pipeSignal <- sizeA
 	}()
 
 	go func() {
-		Copy(connB, connA)
-		pipeSignal <- struct{}{}
+		sizeB, _ := Copy(connB, connA)
+		pipeSignal <- sizeB
 	}()
-
-	<-pipeSignal
+	var totalSize int
+	totalSize += <-pipeSignal
+	return totalSize
 }
 
 func Copy(dst net.Conn, src net.Conn) (int, error) {
