@@ -2,7 +2,10 @@ module github.com/lee-cq/tailscale-transport
 
 go 1.20
 
-require tailscale.com v1.44.0
+require (
+	github.com/sirupsen/logrus v1.9.0
+	tailscale.com v1.44.0
+)
 
 require (
 	filippo.io/edwards25519 v1.0.0 // indirect

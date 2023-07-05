@@ -4,13 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io"
 	"net"
 	"os"
 	"time"
 
-	"github.com/lee-cq/tailscale-transport/logger"
+	log "github.com/sirupsen/logrus"
 	"tailscale.com/tsnet"
 )
 
@@ -33,6 +32,8 @@ var (
 	configFile = flag.String("c", "config.json", "配置文件")
 	newFile    = flag.Bool("n", false, "在当前目录中创建模板")
 )
+
+var logger = log.WithFields(log.Fields{"name": "port-forwarder"})
 
 // 创建配置文件模版
 func createConfig() {
@@ -58,12 +59,12 @@ func createConfig() {
 	jsonBytes, _ := json.Marshal(config)
 
 	dir, _ := os.Getwd()
-	fmt.Printf("在 %s 目录下创建 config.json .... \n", dir)
+	logger.Info("在 %s 目录下创建 config.json .... \n", dir)
 	err := os.WriteFile("config.json", jsonBytes, 0o0664)
 	if err != nil {
-		fmt.Println("Write Error")
+		logger.Error("Write Error")
 	}
-	fmt.Println(" Done.")
+	logger.Info(" Done.")
 }
 
 // GetConfig 命令行参数解析
@@ -77,20 +78,20 @@ func GetConfig() {
 
 	jsonBytes, err := os.ReadFile(*configFile)
 	if err != nil {
-		fmt.Printf("无效的配置文件或路径: %v \n", err)
+		logger.Error("无效的配置文件或路径: %v \n", err)
 		os.Exit(1)
 	}
 
 	err = json.Unmarshal(jsonBytes, &config)
 	if err != nil {
-		fmt.Printf("Json 解析失败 %v \n", err)
+		logger.Error("Json 解析失败 %v \n", err)
 		os.Exit(1)
 	}
-	logger.Info("配置解析完成, hostname: %s", config.Hostname)
+	log.WithFields(log.Fields{}).Info("配置解析完成, hostname: %s", config.Hostname)
 }
 
 func main() {
-	defer fmt.Println("All End ...")
+	defer logger.Info("All End ...")
 	GetConfig()
 
 	logger.Info("初始化 tsnet.Server, 配置相关服务")
@@ -103,16 +104,16 @@ func main() {
 	if config.Dir != "" {
 		tsServer.Dir = config.Dir
 	}
-	defer fmt.Println("tsnet Server a has topped .")
+	defer logger.Info("tsnet Server a has topped .")
 	defer func(tsServer *tsnet.Server) {
 		err := tsServer.Close()
 		if err != nil {
-			fmt.Println("Tsnet Close Error.")
+			logger.Error("Tsnet Close Error.")
 			return
 		}
 	}(tsServer)
 
-	fmt.Println("开始链接至tsnet")
+	logger.Info("开始链接至tsnet")
 	if err := tsServer.Start(); err != nil {
 		return
 	}
@@ -122,19 +123,20 @@ func main() {
 
 	mainSignal := make(chan int)
 	for i := 0; i < len(config.Transports); i++ {
-		fmt.Printf("创建Goroutine %s -> %s\n", config.Transports[i].RemotePort, config.Transports[i].LocalPort)
+		logger.Info("创建Goroutine %s -> %s\n", config.Transports[i].RemotePort, config.Transports[i].LocalPort)
 		go func(transport Transport) {
 			local2RemoteTCP(tsServer, transport.RemotePort, transport.LocalPort)
 			mainSignal <- 1
 		}(config.Transports[i])
 	}
 
-	defer fmt.Println("Ok, Will be Done ... ")
+	defer logger.Info("Ok, Will be Done ... ")
 	var allDone int
 	allT := len(config.Transports)
 	for {
 		allDone += <-mainSignal
 		if allDone >= allT {
+			logger.Warn("All Goroutines is Done. Will Break.")
 			break
 		}
 	}
@@ -238,7 +240,7 @@ func Copy(dst net.Conn, src net.Conn) (int, error) {
 			nw, ew = dst.Write(buffer[:nr])
 
 			if nw > 0 {
-				logger.Info("%s == [%d bytes] ==> %s", src.RemoteAddr().String(), nw, dst.LocalAddr().String())
+				logger.Debug("%s == [%d bytes] ==> %s", src.RemoteAddr().String(), nw, dst.LocalAddr().String())
 				written += nw
 			}
 			if ew != nil {
