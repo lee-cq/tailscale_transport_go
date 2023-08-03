@@ -100,6 +100,7 @@ func main() {
 	tsServer.Ephemeral = config.Ephemeral
 	if config.Authkey != "" {
 		tsServer.AuthKey = config.Authkey
+		logger.WithFields(log.Fields{"key": config.Authkey[:10] + "******"}).Info("Update AuthKey.")
 	}
 	if config.Dir != "" {
 		tsServer.Dir = config.Dir
@@ -113,12 +114,10 @@ func main() {
 		}
 	}(tsServer)
 
-	logger.Info("开始链接至tsnet")
-	if err := tsServer.Start(); err != nil {
+	err := connectTsnet(tsServer)
+	if err != nil {
 		return
 	}
-	ip4, _ := tsServer.TailscaleIPs()
-	logger.Info("tsnet Start Success, IP: %s", ip4)
 	// 配置tsServer完成 ...
 
 	mainSignal := make(chan int)
@@ -138,6 +137,29 @@ func main() {
 		if allDone >= allT {
 			logger.Warn("All Goroutines is Done. Will Break.")
 			break
+		}
+	}
+}
+
+func connectTsnet(tsServer *tsnet.Server) error {
+
+	logger.Info("开始链接至tsnet")
+	if err := tsServer.Start(); err != nil {
+		return err
+	}
+
+	var times int
+	for {
+		times++
+		ip4, _ := tsServer.TailscaleIPs()
+		if ip4.String()[:3] == "100" {
+			logger.Info("tsnet Start Success, IP: %s", ip4.String())
+			return nil
+		} else {
+			if times%10 == 1 {
+				logger.WithField("ip4", ip4.String()).Warn("沒有有效的IPv4地址.")
+			}
+			time.Sleep(3 * time.Second)
 		}
 	}
 }
